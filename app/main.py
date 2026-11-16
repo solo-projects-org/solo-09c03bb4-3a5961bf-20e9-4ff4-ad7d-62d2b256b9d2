@@ -1,8 +1,9 @@
-"""诊断网页与编排 API：提交批次、查询批次/时间线、运行时调参并下发到源站/质控。"""
-import asyncio
+"""诊断网页与编排 API：提交批次、查询批次/时间线、运行时调参并下发到源站/质控。
+启动时自动接续未定稿批次(恢复)，并暴露恢复状态/时间线。"""
 import json
 import os
 import time
+from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import Body, FastAPI
@@ -16,7 +17,21 @@ SOURCE_URL = os.environ.get("SOURCE_URL", "http://localhost:8001")
 QC_URL = os.environ.get("QC_URL", "http://localhost:8002")
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
-app = FastAPI(title="样品入仓链路诊断")
+
+@asynccontextmanager
+async def lifespan(app):
+    # 启动即接续：把重启时仍在 running 的调用标为 interrupted，再续跑未定稿批次。
+    # 恢复在后台任务中进行，不影响网页与其他批次提交。
+    try:
+        resumed = await pipeline.recover_pending()
+        if resumed:
+            print(f"[recovery] 接续未定稿批次: {resumed}", flush=True)
+    except Exception as e:
+        print(f"[recovery] 启动恢复失败: {type(e).__name__}: {e}", flush=True)
+    yield
+
+
+app = FastAPI(title="样品入仓链路诊断", lifespan=lifespan)
 
 
 @app.get("/")
@@ -34,13 +49,16 @@ async def create_batch(body: dict = Body(...)):
         "INSERT INTO batches(created_at, sample_ids, status) VALUES(?,?,?)",
         (time.time(), json.dumps(ids, ensure_ascii=False), "running"))
     bid = cur.lastrowid
-    asyncio.create_task(pipeline.run_batch(bid, ids))
+    pipeline.start_batch(bid, ids)
     return {"id": bid, "samples": len(ids)}
 
 
 @app.get("/api/batches")
 async def list_batches():
     rows = db.query("SELECT * FROM batches ORDER BY id DESC LIMIT 100")
+    recs = {}
+    for r in db.recent_recoveries(500):
+        recs.setdefault(r["batch_id"], []).append(r)
     out = []
     for b in rows:
         item = {"id": b["id"], "status": b["status"], "created_at": b["created_at"],
@@ -49,6 +67,12 @@ async def list_batches():
             c = json.loads(b["conclusion"])
             item.update({"bottleneck": c.get("bottleneck"), "wall_s": c.get("wall_s"),
                          "stored": c.get("samples_stored")})
+        br = recs.get(b["id"], [])
+        item["recovery"] = {
+            "count": len(br),
+            "status": br[-1]["status"] if br else None,
+            "last_id": br[-1]["id"] if br else None,
+        } if br else None
         out.append(item)
     return out
 
@@ -62,13 +86,33 @@ async def batch_detail(bid: int):
     wh = db.query("SELECT * FROM warehouse WHERE batch_id=? ORDER BY stored_at", (bid,))
     # 结论按当前记录实时重算：迟到跨度随时可能补记，看到的一定与记录一致
     concl = analysis.analyze(bid) if spans else None
+    recs = db.recoveries_for(bid)
     return {
         "batch": {"id": b["id"], "status": b["status"], "created_at": b["created_at"],
                   "finished_at": b["finished_at"], "sample_ids": json.loads(b["sample_ids"])},
         "spans": spans,
         "warehouse": wh,
         "conclusion": concl,
+        "recoveries": recs,
     }
+
+
+@app.get("/api/recoveries")
+async def list_recoveries():
+    """恢复总览：本服务历次启动恢复及其状态/时间线(最近 50 条)。"""
+    recs = db.recent_recoveries(50)
+    batches = {b["id"]: b for b in db.query("SELECT id,status FROM batches")}
+    for r in recs:
+        b = batches.get(r["batch_id"])
+        r["batch_status"] = b["status"] if b else None
+    return recs
+
+
+@app.post("/api/recover")
+async def trigger_recovery():
+    """手工触发一次接续(与启动恢复同一逻辑，幂等；用于演示/排查)。"""
+    ids = await pipeline.recover_pending()
+    return {"resumed_batches": ids}
 
 
 @app.post("/api/ingest")

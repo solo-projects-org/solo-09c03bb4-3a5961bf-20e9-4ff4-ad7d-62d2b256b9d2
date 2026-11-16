@@ -8,12 +8,12 @@ services:
       QC_URL: http://qc:8000
       DB_PATH: /data/orch.db
     volumes:
-      - orch-data:/data
+      - orch-data:/data          # SQLite 持久化：容器重启后据此接续未定稿批次
     depends_on:
       source:
-        condition: service_started
+        condition: service_healthy
       qc:
-        condition: service_started
+        condition: service_healthy
 
   source:                      # 独立检验源：返回样品号+浓度；名额槽位/延迟/首次失败可调
     build: ./source_app
@@ -24,6 +24,13 @@ services:
       SOURCE_DELAY_MS: "300"
       SOURCE_SLOTS: "3"
       SOURCE_FAIL_FIRST: "0"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+      start_period: 3s
 
   qc:                          # 质控服务：①非负值 ②样品号对应，两项独立调延迟/首次失败
     build: ./qc_app
@@ -33,6 +40,13 @@ services:
       ORCH_URL: http://orchestrator:8000
       QC_NONNEG_DELAY_MS: "200"
       QC_MATCH_DELAY_MS: "200"
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+      start_period: 3s
 
 volumes:
   orch-data:

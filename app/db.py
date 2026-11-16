@@ -36,7 +36,8 @@ CREATE TABLE IF NOT EXISTS spans (
   end_ts REAL,
   queue_ms REAL,                     -- 服务端等名额(槽位)耗时
   detail TEXT,                       -- JSON
-  note TEXT NOT NULL DEFAULT ''
+  note TEXT NOT NULL DEFAULT '',
+  recovery_id INTEGER              -- 非空表示该调用由启动恢复发起(旧批次接续)
 );
 CREATE INDEX IF NOT EXISTS idx_spans_batch ON spans(batch_id);
 CREATE INDEX IF NOT EXISTS idx_spans_req ON spans(request_id);
@@ -53,10 +54,29 @@ CREATE TABLE IF NOT EXISTS kv (
   k TEXT PRIMARY KEY,
   v TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS recoveries (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  batch_id INTEGER NOT NULL,
+  trigger TEXT NOT NULL,             -- startup
+  started_at REAL NOT NULL,
+  finished_at REAL,
+  status TEXT NOT NULL DEFAULT 'running',   -- running / done / failed / interrupted
+  decisions TEXT,                    -- JSON [{sample_id,action,stage,detail,at}]
+  resumed_samples TEXT,              -- JSON array：恢复时接续的样品
+  preserved_samples TEXT,            -- JSON array：保持原结论的样品
+  unconfirmed TEXT,                  -- JSON [{sample_id,stage,detail,warehouse_id}]
+  interrupted_spans INTEGER NOT NULL DEFAULT 0,
+  note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_recoveries_batch ON recoveries(batch_id);
 """
 
 with _lock:
     _conn.executescript(SCHEMA)
+    # 旧库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加列
+    _cols = {r[1] for r in _conn.execute("PRAGMA table_info(spans)").fetchall()}
+    if "recovery_id" not in _cols:
+        _conn.execute("ALTER TABLE spans ADD COLUMN recovery_id INTEGER")
     _conn.commit()
 
 
@@ -80,13 +100,14 @@ def query_one(sql, args=()):
 # ---------- 跨度 ----------
 
 def insert_span(batch_id, sample_id, stage, side, service, attempt, request_id,
-                status, start_ts, queue_ms=None, detail=None):
+                status, start_ts, queue_ms=None, detail=None, recovery_id=None):
     cur = execute(
         "INSERT INTO spans(batch_id,sample_id,stage,side,service,attempt,request_id,"
-        "status,start_ts,queue_ms,detail) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+        "status,start_ts,queue_ms,detail,recovery_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
         (batch_id, sample_id, stage, side, service, attempt, request_id, status,
          start_ts, queue_ms,
-         json.dumps(detail, ensure_ascii=False) if detail is not None else None))
+         json.dumps(detail, ensure_ascii=False) if detail is not None else None,
+         recovery_id))
     return cur.lastrowid
 
 
@@ -115,6 +136,30 @@ def mark_status(span_id, status, note=None, only_if=None):
     execute(sql, args)
 
 
+def interrupt_running_client_spans(note, exclude_batches=()):
+    """把重启时仍在 running 的编排侧调用如实标为中断，返回被标记的 [(span_id, batch_id)]。
+    exclude_batches 内的批次不动(本进程正在跑它们，避免手工触发恢复时误伤活跃调用)。"""
+    with _lock:
+        if exclude_batches:
+            marks = ",".join("?" * len(exclude_batches))
+            rows = _conn.execute(
+                "SELECT id,batch_id FROM spans WHERE side='client' AND status='running' "
+                f"AND batch_id NOT IN ({marks})", exclude_batches).fetchall()
+            _conn.execute(
+                "UPDATE spans SET status='interrupted', note=note||? "
+                "WHERE side='client' AND status='running' "
+                f"AND batch_id NOT IN ({marks})", (note, *exclude_batches))
+        else:
+            rows = _conn.execute(
+                "SELECT id,batch_id FROM spans WHERE side='client' "
+                "AND status='running'").fetchall()
+            _conn.execute(
+                "UPDATE spans SET status='interrupted', note=note||? "
+                "WHERE side='client' AND status='running'", (note,))
+        _conn.commit()
+        return [(r["id"], r["batch_id"]) for r in rows]
+
+
 # ---------- 入仓 ----------
 
 def warehouse_insert(batch_id, sample_id, concentration, request_id):
@@ -124,6 +169,97 @@ def warehouse_insert(batch_id, sample_id, concentration, request_id):
         " VALUES(?,?,?,?,?)",
         (batch_id, sample_id, concentration, time.time(), request_id))
     return cur.rowcount == 1
+
+
+# ---------- 恢复 ----------
+
+def recovery_insert(batch_id, trigger, resumed_samples, preserved_samples,
+                    interrupted_spans, note=""):
+    cur = execute(
+        "INSERT INTO recoveries(batch_id,trigger,started_at,status,decisions,resumed_samples,"
+        "preserved_samples,unconfirmed,interrupted_spans,note) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (batch_id, trigger, time.time(), "running", "[]",
+         json.dumps(resumed_samples, ensure_ascii=False),
+         json.dumps(preserved_samples, ensure_ascii=False), "[]",
+         interrupted_spans, note))
+    return cur.lastrowid
+
+
+def recovery_append(recovery_id, field, item):
+    """把一条明细追加进 recoveries 的 JSON 数组列(decisions/unconfirmed/preserved_samples)。
+    读改写在同一把锁内完成，恢复中的多样品并发记录不会互相覆盖。"""
+    assert field in ("decisions", "unconfirmed", "preserved_samples", "resumed_samples")
+    with _lock:
+        row = _conn.execute(f"SELECT {field} FROM recoveries WHERE id=?",
+                            (recovery_id,)).fetchone()
+        if not row:
+            return
+        try:
+            arr = json.loads(row[field]) if row[field] else []
+        except Exception:
+            arr = []
+        arr.append(item)
+        _conn.execute(f"UPDATE recoveries SET {field}=? WHERE id=?",
+                      (json.dumps(arr, ensure_ascii=False), recovery_id))
+        _conn.commit()
+
+
+def recovery_finish(recovery_id, status, note=None):
+    if note:
+        execute("UPDATE recoveries SET status=?, finished_at=?, note=note||? WHERE id=?",
+                (status, time.time(), note, recovery_id))
+    else:
+        execute("UPDATE recoveries SET status=?, finished_at=? WHERE id=?",
+                (status, time.time(), recovery_id))
+
+
+def recoveries_for(batch_id):
+    rows = query("SELECT * FROM recoveries WHERE batch_id=? ORDER BY id", (batch_id,))
+    for r in rows:
+        for k in ("decisions", "unconfirmed", "resumed_samples", "preserved_samples"):
+            try:
+                r[k] = json.loads(r[k]) if r[k] else []
+            except Exception:
+                r[k] = []
+    return rows
+
+
+def recent_recoveries(limit=50):
+    rows = query("SELECT * FROM recoveries ORDER BY id DESC LIMIT ?", (limit,))
+    for r in rows:
+        for k in ("decisions", "unconfirmed", "resumed_samples", "preserved_samples"):
+            try:
+                r[k] = json.loads(r[k]) if r[k] else []
+            except Exception:
+                r[k] = []
+    return rows
+
+
+def mark_recovery_interrupted(exclude_batches=()):
+    """整理上次进程遗留的"运行中"恢复记录：
+    - 批次仍未定稿 → interrupted，下一次启动会重新接续；
+    - 批次已定稿(定稿后进程才退出) → done，不误报为中断。
+    exclude_batches 内由本进程正在恢复，不处理。"""
+    with _lock:
+        rows = _conn.execute(
+            "SELECT r.id, r.batch_id, b.status AS bstatus FROM recoveries r "
+            "LEFT JOIN batches b ON b.id=r.batch_id WHERE r.status='running'").fetchall()
+        now = time.time()
+        for r in rows:
+            if r["batch_id"] in exclude_batches:
+                continue
+            if r["bstatus"] == "running":
+                _conn.execute(
+                    "UPDATE recoveries SET status='interrupted', finished_at=?, "
+                    "note=note||? WHERE id=?",
+                    (now, " 编排端在恢复过程中重启，本次恢复未完成，将由下一次启动重新接续。",
+                     r["id"]))
+            else:
+                _conn.execute(
+                    "UPDATE recoveries SET status='done', finished_at=?, note=note||? "
+                    "WHERE id=?",
+                    (now, " 批次已定稿后编排端退出；本次恢复实际已完成。", r["id"]))
+        _conn.commit()
 
 
 # ---------- 配置 ----------

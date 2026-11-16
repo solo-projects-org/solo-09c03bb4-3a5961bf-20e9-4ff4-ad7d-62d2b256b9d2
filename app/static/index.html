@@ -32,6 +32,7 @@
   tr.clickable:hover { background: #ddf4ff; }
   .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; color: #fff; }
   .st-running { background: #1e88e5; } .st-done { background: #2e7d32; } .st-failed { background: #c62828; }
+  .st-recovering { background: #6a1b9a; }
   .muted { color: #57606a; } .mono { font-family: ui-monospace, monospace; }
   .concl { background: #f0f6ff; border-left: 4px solid #1f6feb; padding: 8px 12px; border-radius: 4px; }
   .concl.fail { background: #fff0f0; border-left-color: #c62828; }
@@ -47,6 +48,8 @@
   .sp-effective { background: #2e7d32; } .sp-ok { background: #26a69a; }
   .sp-failed { background: #c62828; } .sp-timeout { background: #ef6c00; }
   .sp-late { background: #9e9e9e; } .sp-running { background: #1e88e5; }
+  .sp-interrupted { background: #6a1b9a; }
+  .st-interrupted { background: #6a1b9a; }
   .wf-axis { position: relative; height: 16px; margin-left: 245px; margin-right: 70px;
              font-size: 11px; color: #57606a; }
   .wf-axis span { position: absolute; transform: translateX(-50%); }
@@ -103,14 +106,24 @@ S1006</textarea>
   <h2>③ 批次列表(自动刷新;多批交错运行,记录互不串)</h2>
   <table id="batchTable">
     <thead><tr><th>批次</th><th>状态</th><th>样品数</th><th>入仓</th><th>墙钟 s</th>
-      <th>瓶颈判定</th><th>提交时间</th><th>操作</th></tr></thead>
+      <th>瓶颈判定</th><th>提交时间</th><th>恢复</th><th>操作</th></tr></thead>
     <tbody></tbody>
   </table>
+  <div style="margin-top:10px">
+    <button class="ghost" onclick="triggerRecovery()">立即接续未定稿批次</button>
+    <span id="recoverResult" class="muted" style="font-size:12px;margin-left:8px">
+      启动时自动接续;此处可手动触发同一次幂等恢复</span>
+  </div>
 </section>
 
 <section id="detail" hidden>
   <h2 id="detailTitle">批次详情</h2>
   <div id="conclBox"></div>
+  <div id="recoveryPanel" hidden style="margin-top:10px">
+    <h2>恢复记录与时间线</h2>
+    <div id="recoverySummary" class="muted" style="font-size:12px;margin-bottom:8px"></div>
+    <div id="recoveryTimeline"></div>
+  </div>
   <div id="chainBox" style="margin-top:10px"></div>
   <div id="stageBox" style="margin-top:10px"></div>
   <h2 style="margin-top:14px">跨服务时间线(条块=一次真实调用;黄框=关键链)</h2>
@@ -118,7 +131,8 @@ S1006</textarea>
     <span><i class="sp-effective"></i>有效尝试</span><span><i class="sp-ok"></i>正常(质控/入仓)</span>
     <span><i class="sp-failed"></i>失败/未通过</span><span><i class="sp-timeout"></i>超时放弃</span>
     <span><i class="sp-late"></i>迟到(未采用)</span><span><i class="sp-running"></i>进行中</span>
-    <span class="muted">半透明细条=服务端上报跨度(含等名额)</span>
+    <span><i class="sp-interrupted"></i>重启中断(结果未确认)</span>
+    <span class="muted">半透明细条=服务端上报跨度(含等名额);↻=启动恢复发起</span>
   </div>
   <div class="wf" id="wf"></div>
   <div id="spansBox" style="margin-top:12px"></div>
@@ -169,12 +183,23 @@ async function refreshBatches(){
     <td>#${b.id}</td><td><span class="pill st-${b.status}">${b.status}</span></td>
     <td>${b.samples}</td><td>${b.stored??'-'}</td><td>${b.wall_s??'-'}</td>
     <td>${b.bottleneck??'-'}</td><td class="mono">${fmtTs(b.created_at)}</td>
+    <td>${b.recovery? `<span class="pill st-${b.recovery.status==='done'?'done':b.recovery.status==='failed'?'failed':'recovering'}">${b.recovery.status}</span> <span class="muted">×${b.recovery.count}</span>`:'-'}</td>
     <td><button class="ghost" onclick="event.stopPropagation();openBatch(${b.id})">详情</button></td>
   </tr>`).join('');
   if(currentBatch!==null){
     const cur = rows.find(x=>x.id===currentBatch);
     if(cur && cur.status==='running') loadDetail(currentBatch);
   }
+}
+
+async function triggerRecovery(){
+  const r = await (await fetch('/api/recover',{method:'POST'})).json();
+  const el = document.getElementById('recoverResult');
+  el.textContent = r.resumed_batches && r.resumed_batches.length
+    ? '已接续批次: '+r.resumed_batches.map(x=>'#'+x).join('、')
+    : '没有需要接续的未定稿批次';
+  refreshBatches();
+  if(currentBatch!==null) loadDetail(currentBatch);
 }
 
 async function openBatch(id){ currentBatch=id; await loadDetail(id); }
@@ -184,16 +209,72 @@ async function loadDetail(id){
   document.getElementById('detail').hidden = false;
   document.getElementById('detailTitle').textContent =
     `批次 #${id} 详情(状态 ${d.batch.status},样品 ${d.batch.sample_ids.length} 个)`;
-  renderConclusion(d); renderChain(d); renderStages(d); renderWaterfall(d);
+  renderConclusion(d); renderRecovery(d); renderChain(d); renderStages(d); renderWaterfall(d);
   renderSpans(d); renderWarehouse(d);
+}
+
+const ACT_LABEL = {
+  resume_plan:'恢复计划', resumed_fetch:'接续取数', fetch_failed:'取数未成功',
+  reused_fetch:'复用已有取数', resumed_qc:'补做质控', qc_failed:'质控未通过',
+  reused_qc:'沿用已有质控', warehouse_inserted:'写入入仓', warehouse_deduped:'入仓幂等去重',
+  preserved_stored:'已入仓保持原结论', preserved_qc_failed:'质控不通过保持原结论',
+  preserved:'保持原结论',
+  warehouse_call_unfinished:'入仓调用记录未完成', error:'恢复出错'};
+
+function renderRecovery(d){
+  const recs = d.recoveries || [];
+  document.getElementById('recoveryPanel').hidden = !recs.length;
+  if(!recs.length){ document.getElementById('recoveryTimeline').innerHTML=''; return; }
+  const last = recs[recs.length-1];
+  document.getElementById('recoverySummary').innerHTML =
+    `本批共经历 <b>${recs.length}</b> 次启动恢复；最近一次 #${last.id} 状态
+     <span class="pill st-${last.status==='done'?'done':last.status==='failed'?'failed':'recovering'}">${last.status}</span>
+     开始 ${fmtTs(last.started_at)}${last.finished_at?`，结束 ${fmtTs(last.finished_at)}`:''}
+     ${last.note?`<span class="muted">— ${last.note}</span>`:''}`;
+  const rows = recs.map(r=>{
+    const decisions = (r.decisions||[]).map(x=>
+      `<div class="muted" style="font-size:12px">${fmtTs(x.at)}
+        <b>${ACT_LABEL[x.action]||x.action}</b>
+        ${x.sample_id?`样品 <span class="mono">${x.sample_id}</span> `:''}${x.detail}</div>`).join('');
+    const unconf = (r.unconfirmed||[]).map(u=>
+      `<div style="font-size:12px;color:#b26a00">样品 <span class="mono">${u.sample_id}</span>
+        ${STAGE_LABEL[u.stage]||u.stage}: ${u.detail}</div>`).join('');
+    const preserved = (r.preserved_samples||[]).map(p=>
+      `<span class="mono" title="${p.reason}">${p.sample_id}</span>`).join('、');
+    const resumed = (r.resumed_samples||[]).map(s=>`<span class="mono">${s}</span>`).join('、');
+    return `<tr><td>#${r.id}</td>
+      <td><span class="pill st-${r.status==='done'?'done':r.status==='failed'?'failed':'recovering'}">${r.status}</span></td>
+      <td class="mono">${fmtTs(r.started_at)}</td>
+      <td class="mono">${r.finished_at?fmtTs(r.finished_at):'-'}</td>
+      <td>${r.interrupted_spans}</td>
+      <td style="font-size:12px">接续: ${resumed||'-'}<br>保持原结论: ${preserved||'-'}</td></tr>
+      <tr><td colspan="6" style="background:#fafbfc">
+        ${decisions||'<span class="muted" style="font-size:12px">暂无恢复动作记录</span>'}
+        ${unconf?`<div style="margin-top:6px"><b style="font-size:12px">未确认环节:</b>${unconf}</div>`:''}
+        ${r.note?`<div class="muted" style="font-size:12px;margin-top:4px">${r.note}</div>`:''}
+      </td></tr>`;
+  }).join('');
+  document.getElementById('recoveryTimeline').innerHTML =
+    `<table><thead><tr><th>恢复</th><th>状态</th><th>开始</th><th>结束</th>
+      <th>中断调用数</th><th>样品处置</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function renderConclusion(d){
   const c = d.conclusion;
+  const rec = (d.recoveries||[]).find(r=>r.status==='running');
+  if(d.batch.status==='running'){
+    document.getElementById('conclBox').innerHTML = rec
+      ? `<div class="concl">批次运行中(恢复 #${rec.id} 接续中),结论待定稿…(已完成阶段见下方时间线)</div>`
+      : `<div class="concl">批次运行中,结论待定稿…(已完成阶段见下方时间线)</div>`;
+    return;
+  }
+  if(!c){ document.getElementById('conclBox').innerHTML=''; return; }
+  const unconf = (c.unconfirmed||[]);
+  const unconfHtml = unconf.length ? `<div class="hint"><b>未确认环节(不计入完成依据):</b><br>`+
+    unconf.map(u=>`样品 <span class="mono">${u.sample_id}</span> ${STAGE_LABEL[u.stage]||u.stage}: ${u.detail}`).join('<br>')+
+    `</div>` : '';
   document.getElementById('conclBox').innerHTML =
-    (d.batch.status==='running' || !c)
-    ? `<div class="concl">批次运行中,结论待定稿…(已完成阶段见下方时间线)</div>`
-    : `<div class="concl ${c.status==='done'?'':'fail'}">${c.text}</div>`;
+    `<div class="concl ${c.status==='done'?'':'fail'}">${c.text}</div>` + unconfHtml;
 }
 
 function renderChain(d){
@@ -226,19 +307,22 @@ function renderStages(d){
   if(d.batch.status==='running' || !c || !c.per_stage){ document.getElementById('stageBox').innerHTML=''; return; }
   const rows = Object.entries(c.per_stage).map(([k,v])=>
     `<tr><td>${v.label}</td><td>${v.attempts}</td><td>${v.sum_s}</td><td>${v.wall_s}</td>
-     <td>${v.effective}</td><td>${v.failed}</td><td>${v.late}</td><td>${v.gave_up??0}</td></tr>`).join('');
+     <td>${v.effective}</td><td>${v.failed}</td><td>${v.late}</td><td>${v.gave_up??0}</td>
+     <td>${v.interrupted??0}</td></tr>`).join('');
   document.getElementById('stageBox').innerHTML =
     `<b>分阶段统计(求和≠墙钟:并行质控、重叠重试、多样品并行均不直接相加):</b>
      <table><thead><tr><th>阶段</th><th>调用次数</th><th>耗时求和 s</th><th>墙钟跨度 s</th>
-     <th>有效</th><th>失败</th><th>迟到</th><th>曾超时放弃</th></tr></thead><tbody>${rows}</tbody></table>`;
+     <th>有效</th><th>失败</th><th>迟到</th><th>曾超时放弃</th><th>重启中断</th></tr></thead><tbody>${rows}</tbody></table>`;
 }
 
 function renderWaterfall(d){
   const spans = d.spans.filter(s=>s.start_ts);
   const el = document.getElementById('wf');
   if(!spans.length){ el.innerHTML='<span class="muted">暂无调用记录</span>'; return; }
-  const t0 = Math.min(...spans.map(s=>s.start_ts));
-  const t1 = Math.max(...spans.map(s=>s.end_ts||s.start_ts), t0+0.001);
+  const stamps = spans.map(s=>s.start_ts).concat(spans.map(s=>s.end_ts||s.start_ts))
+    .concat((d.warehouse||[]).map(w=>w.stored_at));
+  const t0 = Math.min(...stamps);
+  const t1 = Math.max(...stamps, t0+0.001);
   const span = t1-t0;
   const crit = new Set();
   if(d.conclusion && d.conclusion.chain)
@@ -253,10 +337,12 @@ function renderWaterfall(d){
   for(const s of sorted){
     const l=((s.start_ts-t0)/span*100), w=Math.max(((s.end_ts||s.start_ts)-s.start_ts)/span*100, .4);
     const label = `${s.sample_id} · ${STAGE_LABEL[s.stage]||s.stage}`+
-      (s.stage==='fetch'?` #${s.attempt}`:'')+(s.side==='server'?` ↳${s.service}服务端`:'');
+      (s.stage==='fetch'?` #${s.attempt}`:'')+(s.side==='server'?` ↳${s.service}服务端`:'')+
+      (s.recovery_id?' ↻恢复':'');
     const dur = s.end_ts? ((s.end_ts-s.start_ts)*1000).toFixed(0)+'ms' : '…';
     const tip = `${label}\n状态:${s.status}  耗时:${dur}`+
-      (s.queue_ms?`\n等名额:${s.queue_ms}ms`:'')+(s.note?`\n${s.note}`:'');
+      (s.queue_ms?`\n等名额:${s.queue_ms}ms`:'')+(s.note?`\n${s.note}`:'')+
+      (s.recovery_id?`\n启动恢复 #${s.recovery_id} 发起`:'');
     rows += `<div class="wf-row"><div class="wf-label" title="${tip}">${label}</div>
       <div class="wf-track"><div class="wf-bar sp-${s.status} ${s.side==='server'?'server':''} ${crit.has(s.id)?'crit':''}"
         style="left:${l}%;width:${w}%" title="${tip}"></div></div></div>`;
